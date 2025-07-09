@@ -1,4 +1,4 @@
-# "AIRLOGDUMP"
+# "Mavlink Decoder And Viewer - MAVLOGREAD"
 A simple decoder for mavlink log files.
 #### Usage:
 
