@@ -83,7 +83,7 @@ int main(int argc, char *argv[]) {
       }
     } else if (args.has("replay")) {
       Vis vis;
-      std::vector<AttitudeFrame> frames = vis.collect_attitude_frames(file);
+      std::vector<StateFrame> frames = vis.collect_state_frames(file);
       vis.visualize_attitude(frames);
 
     } else {
