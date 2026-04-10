@@ -6,10 +6,11 @@
 #include <iostream>
 #include <vector>
 
+// Combined frame for all telemetry
 struct TelemetryFrame {
     uint32_t time_boot_ms;
     float roll, pitch, yaw;
-    Vector3 localPos; // X, Y, Z in meters from starting point
+    Vector3 localPos; 
 };
 
 class Vis {
@@ -20,9 +21,8 @@ public:
         mavlink_status_t status;
         uint8_t byte;
 
-        // State trackers
         float curRoll = 0, curPitch = 0, curYaw = 0;
-        int32_t lat0 = 0, lon0 = 0, alt0 = 0;
+        int32_t lat0 = 0, lon0 = 0;
         bool originSet = false;
 
         while (input.read(reinterpret_cast<char *>(&byte), 1)) {
@@ -43,17 +43,13 @@ public:
                         if (!originSet && pos.lat != 0) {
                             lat0 = pos.lat;
                             lon0 = pos.lon;
-                            alt0 = pos.relative_alt;
                             originSet = true;
                         }
 
-                        // Convert GPS to Meters
-                        // Lat/Lon are in 1e7 degrees. 1 deg ~= 111319 meters.
-                        // I think this is right but realising these convertions would be different
-                        // for some autopilots. 
+                        // Mapping: Lon -> X, Alt -> Y, Lat -> -Z
                         float posZ = (float)(pos.lat - lat0) * 0.0111319f; 
                         float posX = (float)(pos.lon - lon0) * 0.0111319f;
-                        float posY = (float)(pos.relative_alt) / 1000.0f; // mm to m
+                        float posY = (float)(pos.relative_alt) / 1000.0f;
 
                         frames.push_back({pos.time_boot_ms, curRoll, curPitch, curYaw, {posX, posY, -posZ}});
                         break;
@@ -67,68 +63,76 @@ public:
     void visualize(const std::vector<TelemetryFrame> &frames) {
         if (frames.empty()) return;
 
-        InitWindow(1280, 720, "MAVLink LOG PLAYBACK");
+        InitWindow(1280, 720, "MAVLink 3D Visualizer - Orbit Controls");
         
         Camera3D camera = { 0 };
-        camera.position = (Vector3){ 10.0f, 10.0f, 10.0f };
-        camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };
+        camera.position = (Vector3){ 15.0f, 15.0f, 15.0f }; // Initial distance
+        camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };    // Looking at aircraft
         camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
         camera.fovy = 45.0f;
         camera.projection = CAMERA_PERSPECTIVE;
 
         SetTargetFPS(60);
+        
         double startSystemTime = GetTime();
         uint32_t startLogTime = frames[0].time_boot_ms;
 
         while (!WindowShouldClose()) {
+            // 1. Update Playback Timing
             double elapsedMs = (GetTime() - startSystemTime) * 1000.0;
             uint32_t playbackTime = startLogTime + (uint32_t)elapsedMs;
 
-            // Find frames for interp
             size_t idx = 0;
             while (idx + 1 < frames.size() && frames[idx + 1].time_boot_ms < playbackTime) idx++;
             
-            if (idx + 1 >= frames.size()) break; // End of log
+            if (idx + 1 >= frames.size()) break;
 
             const auto &f1 = frames[idx];
             const auto &f2 = frames[idx + 1];
             float t = (float)(playbackTime - f1.time_boot_ms) / (float)(f2.time_boot_ms - f1.time_boot_ms);
 
-            // Interp Position
+            // 2. Interpolate State
             Vector3 currentPos = Vector3Lerp(f1.localPos, f2.localPos, t);
-
-            // SLERP Rotation (needs work)
-            Quaternion q1 = QuaternionFromEuler(f1.pitch, f1.yaw, f1.roll);
-            Quaternion q2 = QuaternionFromEuler(f2.pitch, f2.yaw, f2.roll);
-            Quaternion qInterp = QuaternionSlerp(q1, q2, t);
+            Quaternion qInterp = QuaternionSlerp(
+                QuaternionFromEuler(f1.pitch, f1.yaw, f1.roll),
+                QuaternionFromEuler(f2.pitch, f2.yaw, f2.roll), 
+                t
+            );
             Matrix matRotation = QuaternionToMatrix(qInterp);
 
-            // Camera follow
+            // 3. Update Camera Logic
+            // UpdateCamera automatically handles Mouse Wheel (Zoom) and Mouse Drag (Orbit)
+            // Use CAMERA_THIRD_PERSON to follow a target while allowing rotation around it
+            UpdateCamera(&camera, CAMERA_THIRD_PERSON);
+            
+            // Re-sync camera target to aircraft position so it follows movement
             camera.target = currentPos;
-            camera.position = Vector3Add(currentPos, (Vector3){ 15.0f, 10.0f, 15.0f });
 
             BeginDrawing();
                 ClearBackground(SKYBLUE);
                 BeginMode3D(camera);
                     
-                    DrawGrid(100, 10.0f); // Large ground grid
+                    DrawGrid(100, 10.0f);
                     
                     rlPushMatrix();
-                        // Move to interp pos / rot
                         rlTranslatef(currentPos.x, currentPos.y, currentPos.z);
                         rlMultMatrixf(MatrixToFloat(matRotation));
                         
-                        // Dummy airframe object
-                        DrawCube({ 0, 0, 0 }, 0.8f, 0.4f, 2.5f, RED);   // Fuselage
-                        DrawCube({ 0, 0, 0.2f }, 4.0f, 0.1f, 0.7f, GRAY); // Wings
-                        DrawCubeWires({ 0, 0, 0 }, 0.8f, 0.4f, 2.5f, BLACK);
+                        // Airplane Model
+                        DrawCube({ 0, 0, 0 }, 0.6f, 0.4f, 2.0f, RED);      // Body
+                        DrawCube({ 0, 0.1f, 0.2f }, 3.5f, 0.1f, 0.6f, GRAY); // Wings
+                        DrawCube({ 0, 0.2f, -0.8f }, 1.2f, 0.1f, 0.4f, GRAY); // Tail wings
+                        DrawCubeWires({ 0, 0, 0 }, 0.6f, 0.4f, 2.0f, BLACK);
                     rlPopMatrix();
 
                 EndMode3D();
 
-                DrawRectangle(10, 10, 250, 90, Fade(BLACK, 0.3f));
-                DrawText(TextFormat("ALT: %.2f m", currentPos.y), 20, 20, 20, WHITE);
-                DrawText(TextFormat("X: %.2f Y: %.2f", currentPos.x, currentPos.z), 20, 45, 20, WHITE);
+                // UI
+                DrawRectangle(10, 10, 320, 120, Fade(BLACK, 0.4f));
+                DrawText("CONTROLS:", 20, 20, 10, GOLD);
+                DrawText("- Right Click + Drag: Orbit", 20, 35, 10, WHITE);
+                DrawText("- Mouse Wheel: Zoom", 20, 50, 10, WHITE);
+                DrawText(TextFormat("Altitude: %.1f m", currentPos.y), 20, 75, 20, WHITE);
                 DrawFPS(1180, 10);
             EndDrawing();
         }
