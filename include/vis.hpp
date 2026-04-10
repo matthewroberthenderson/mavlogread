@@ -6,7 +6,6 @@
 #include <iostream>
 #include <vector>
 
-// Combined frame for all telemetry
 struct TelemetryFrame {
     uint32_t time_boot_ms;
     float roll, pitch, yaw;
@@ -46,12 +45,15 @@ public:
                             originSet = true;
                         }
 
-                        // Mapping: Lon -> X, Alt -> Y, Lat -> -Z
-                        float posZ = (float)(pos.lat - lat0) * 0.0111319f; 
-                        float posX = (float)(pos.lon - lon0) * 0.0111319f;
+                        // COORDINATE MAPPING (NED to OpenGL Y-Up):
+                        // North (Lat) -> -Z 
+                        // East (Lon)  -> +X
+                        // Down (Alt)  -> +Y (using relative_alt which is Up)
+                        float posX = (float)(pos.lon - lon0) * 0.0111319f; 
                         float posY = (float)(pos.relative_alt) / 1000.0f;
+                        float posZ = (float)(pos.lat - lat0) * -0.0111319f; 
 
-                        frames.push_back({pos.time_boot_ms, curRoll, curPitch, curYaw, {posX, posY, -posZ}});
+                        frames.push_back({pos.time_boot_ms, curRoll, curPitch, curYaw, {posX, posY, posZ}});
                         break;
                     }
                 }
@@ -61,81 +63,90 @@ public:
     }
 
     void visualize(const std::vector<TelemetryFrame> &frames) {
-        if (frames.empty()) return;
+    if (frames.empty()) return;
 
-        InitWindow(1280, 720, "MAVLink 3D Visualizer - Orbit Controls");
+    InitWindow(1280, 720, "MAVLink 3D - Chase Cam Mode");
+    
+    Camera3D camera = { 0 };
+    // Initial offset: 10 meters back, 5 meters up
+    camera.position = (Vector3){ 0.0f, 5.0f, 10.0f }; 
+    camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };
+    camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+    camera.fovy = 45.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    SetTargetFPS(60);
+    
+    double startSystemTime = GetTime();
+    uint32_t startLogTime = frames[0].time_boot_ms;
+    Vector3 lastPos = frames[0].localPos;
+
+    while (!WindowShouldClose()) {
+        double elapsedMs = (GetTime() - startSystemTime) * 1000.0;
+        uint32_t playbackTime = startLogTime + (uint32_t)elapsedMs;
+
+        size_t idx = 0;
+        while (idx + 1 < frames.size() && frames[idx + 1].time_boot_ms < playbackTime) idx++;
+        if (idx + 1 >= frames.size()) break;
+
+        const auto &f1 = frames[idx];
+        const auto &f2 = frames[idx + 1];
+        float t = (float)(playbackTime - f1.time_boot_ms) / (float)(f2.time_boot_ms - f1.time_boot_ms);
+
+        Vector3 currentPos = Vector3Lerp(f1.localPos, f2.localPos, t);
         
-        Camera3D camera = { 0 };
-        camera.position = (Vector3){ 15.0f, 15.0f, 15.0f }; // Initial distance
-        camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };    // Looking at aircraft
-        camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
-        camera.fovy = 45.0f;
-        camera.projection = CAMERA_PERSPECTIVE;
-
-        SetTargetFPS(60);
+        // Calculate the movement delta since the last frame
+        Vector3 diff = Vector3Subtract(currentPos, lastPos);
         
-        double startSystemTime = GetTime();
-        uint32_t startLogTime = frames[0].time_boot_ms;
+        // --- CAMERA LOGIC: LOCK TO VEHICLE ---
+        // We move the camera's position by the SAME amount the aircraft moved.
+        // This maintains the "Constant Offset" even before user input.
+        camera.position = Vector3Add(camera.position, diff);
+        camera.target = currentPos;
+        lastPos = currentPos;
 
-        while (!WindowShouldClose()) {
-            // 1. Update Playback Timing
-            double elapsedMs = (GetTime() - startSystemTime) * 1000.0;
-            uint32_t playbackTime = startLogTime + (uint32_t)elapsedMs;
+        // Now allow Orbit (Right Click) and Zoom (Wheel) to modify that position
+        UpdateCamera(&camera, CAMERA_THIRD_PERSON);
 
-            size_t idx = 0;
-            while (idx + 1 < frames.size() && frames[idx + 1].time_boot_ms < playbackTime) idx++;
-            
-            if (idx + 1 >= frames.size()) break;
+        // --- RENDER ---
+        BeginDrawing();
+            ClearBackground(SKYBLUE);
+            BeginMode3D(camera);
+                
+                DrawGrid(100, 10.0f);
+                
+                // Draw a simple "Ground" so you can see movement
+                DrawCircleV({0,0}, 1000, Fade(DARKGREEN, 0.5f));
 
-            const auto &f1 = frames[idx];
-            const auto &f2 = frames[idx + 1];
-            float t = (float)(playbackTime - f1.time_boot_ms) / (float)(f2.time_boot_ms - f1.time_boot_ms);
-
-            // 2. Interpolate State
-            Vector3 currentPos = Vector3Lerp(f1.localPos, f2.localPos, t);
-            Quaternion qInterp = QuaternionSlerp(
-                QuaternionFromEuler(f1.pitch, f1.yaw, f1.roll),
-                QuaternionFromEuler(f2.pitch, f2.yaw, f2.roll), 
-                t
-            );
-            Matrix matRotation = QuaternionToMatrix(qInterp);
-
-            // 3. Update Camera Logic
-            // UpdateCamera automatically handles Mouse Wheel (Zoom) and Mouse Drag (Orbit)
-            // Use CAMERA_THIRD_PERSON to follow a target while allowing rotation around it
-            UpdateCamera(&camera, CAMERA_THIRD_PERSON);
-            
-            // Re-sync camera target to aircraft position so it follows movement
-            camera.target = currentPos;
-
-            BeginDrawing();
-                ClearBackground(SKYBLUE);
-                BeginMode3D(camera);
+                rlPushMatrix();
+                    rlTranslatef(currentPos.x, currentPos.y, currentPos.z);
                     
-                    DrawGrid(100, 10.0f);
+                    Quaternion qInterp = QuaternionSlerp(
+                        QuaternionFromEuler(f1.pitch, -f1.yaw, f1.roll),
+                        QuaternionFromEuler(f2.pitch, -f2.yaw, f2.roll), 
+                        t
+                    );
+                    rlMultMatrixf(MatrixToFloat(QuaternionToMatrix(qInterp)));
                     
-                    rlPushMatrix();
-                        rlTranslatef(currentPos.x, currentPos.y, currentPos.z);
-                        rlMultMatrixf(MatrixToFloat(matRotation));
-                        
-                        // Airplane Model
-                        DrawCube({ 0, 0, 0 }, 0.6f, 0.4f, 2.0f, RED);      // Body
-                        DrawCube({ 0, 0.1f, 0.2f }, 3.5f, 0.1f, 0.6f, GRAY); // Wings
-                        DrawCube({ 0, 0.2f, -0.8f }, 1.2f, 0.1f, 0.4f, GRAY); // Tail wings
-                        DrawCubeWires({ 0, 0, 0 }, 0.6f, 0.4f, 2.0f, BLACK);
-                    rlPopMatrix();
+                    // Local Axis Helpers
+                    DrawLine3D({0,0,0}, {5,0,0}, RED);   // Right
+                    DrawLine3D({0,0,0}, {0,5,0}, GREEN); // Up
+                    DrawLine3D({0,0,0}, {0,0,5}, BLUE);  // Forward (Nose)
+                    
+                    // Airplane Mesh (Longer on Z axis)
+                    DrawCube({ 0, 0, 0 }, 0.5f, 0.5f, 2.0f, RED); 
+                    DrawCube({ 0, 0, 0.3f }, 3.0f, 0.1f, 0.6f, LIGHTGRAY);
+                rlPopMatrix();
 
-                EndMode3D();
+            EndMode3D();
 
-                // UI
-                DrawRectangle(10, 10, 320, 120, Fade(BLACK, 0.4f));
-                DrawText("CONTROLS:", 20, 20, 10, GOLD);
-                DrawText("- Right Click + Drag: Orbit", 20, 35, 10, WHITE);
-                DrawText("- Mouse Wheel: Zoom", 20, 50, 10, WHITE);
-                DrawText(TextFormat("Altitude: %.1f m", currentPos.y), 20, 75, 20, WHITE);
-                DrawFPS(1180, 10);
-            EndDrawing();
-        }
-        CloseWindow();
+            // UI
+            DrawRectangle(10, 10, 250, 60, Fade(BLACK, 0.5f));
+            DrawText(TextFormat("ALT: %.2f m", currentPos.y), 20, 20, 20, WHITE);
+            DrawText("Right-Click to Orbit / Wheel to Zoom", 20, 45, 10, GRAY);
+            
+        EndDrawing();
     }
+    CloseWindow();
+}
 };
